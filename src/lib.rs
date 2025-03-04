@@ -179,14 +179,14 @@ impl SmolKv {
         Self::handle_response::<Value>(resp).await.map(|_| ())
     }
 
-    pub async fn delete(&self, collection: &str, key: &str) -> Result<()> {
-        let resp = self
+    pub async fn delete(&self, collection: &str, key: &str) -> Result<bool> {
+        Ok(self
             .client
             .delete(self.url(format!("/{}/{}", collection, key)))
             .send()
-            .await?;
-
-        Self::handle_response::<Value>(resp).await.map(|_| ())
+            .await?
+            .status()
+            .is_success())
     }
 
     pub async fn exists(&self, collection: &str, key: &str) -> Result<bool> {

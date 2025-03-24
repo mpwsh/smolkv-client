@@ -82,13 +82,19 @@ pub struct SmolKv {
 }
 
 impl SmolKv {
-    pub fn new(endpoint: impl Into<String>, secret: impl Into<String>) -> Self {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("X-SECRET-KEY", secret.into().parse().unwrap());
+    pub fn new(endpoint: impl Into<String>, secret: Option<impl Into<String>>) -> Self {
+        let client = match secret {
+            Some(secret_key) => {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("X-SECRET-KEY", secret_key.into().parse().unwrap());
+                Client::builder().default_headers(headers).build().unwrap()
+            }
+            None => Client::new(),
+        };
 
         Self {
             endpoint: endpoint.into(),
-            client: Client::builder().default_headers(headers).build().unwrap(),
+            client,
         }
     }
 
@@ -111,78 +117,83 @@ impl SmolKv {
     pub async fn collection_exists(&self, name: &str) -> Result<bool> {
         Ok(self
             .client
-            .head(self.url(format!("/{}", name)))
+            .head(self.url(name))
             .send()
             .await?
             .status()
             .is_success())
     }
 
-    pub async fn create_collection(&self, name: &str) -> Result<()> {
-        let resp = self
-            .client
-            .put(self.url(format!("/{}", name)))
-            .send()
-            .await?;
+    pub async fn create_collection(&self, name: &str) -> Result<Value> {
+        let resp = self.client.put(self.url(name)).send().await?;
 
-        Self::handle_response::<Value>(resp).await.map(|_| ())
+        Self::handle_response(resp).await
     }
 
-    pub async fn drop_collection(&self, name: &str) -> Result<()> {
+    pub async fn drop_collection(&self, name: &str) -> Result<Value> {
         let resp = self
             .client
             .delete(self.url(format!("/{}", name)))
             .send()
             .await?;
 
-        Self::handle_response::<Value>(resp).await.map(|_| ())
+        Self::handle_response(resp).await
     }
 
     pub async fn list_collection(&self, name: &str, query: QueryBuilder) -> Result<Vec<Value>> {
-        let resp = self
-            .client
-            .get(self.url(format!("/{}", name)))
-            .query(&query)
-            .send()
-            .await?;
+        let resp = self.client.get(self.url(name)).query(&query).send().await?;
         Self::handle_response(resp).await
     }
 
     pub async fn query_collection(&self, name: &str, query: QueryBuilder) -> Result<Vec<Value>> {
-        let resp = self
-            .client
-            .post(self.url(format!("/{}", name)))
-            .json(&query)
-            .send()
-            .await?;
+        let resp = self.client.post(self.url(name)).json(&query).send().await?;
         Self::handle_response(resp).await
     }
     // key operations
     pub async fn get<T: DeserializeOwned>(&self, collection: &str, key: &str) -> Result<T> {
         let resp = self
             .client
-            .get(self.url(format!("/{}/{}", collection, key)))
+            .get(self.url(format!("{collection}/{key}")))
             .send()
             .await?;
 
         Self::handle_response(resp).await
     }
 
-    pub async fn put<T: Serialize>(&self, collection: &str, key: &str, value: &T) -> Result<()> {
+    pub async fn put<T: Serialize>(&self, collection: &str, key: &str, value: &T) -> Result<Value> {
         let resp = self
             .client
-            .put(self.url(format!("/{}/{}", collection, key)))
+            .put(self.url(format!("{collection}/{key}")))
             .json(value)
             .send()
             .await?;
 
-        Self::handle_response::<Value>(resp).await.map(|_| ())
+        Self::handle_response(resp).await
+    }
+    pub async fn import_values(
+        &self,
+        collection: &str,
+        key: Option<String>,
+        values: Vec<u8>,
+    ) -> Result<Value> {
+        let part = reqwest::multipart::Part::bytes(values).file_name("backup.sst");
+        let form = reqwest::multipart::Form::new().part("file", part);
+
+        let resp = self
+            .client
+            .post(self.url(format!("{collection}/_import")))
+            .multipart(form)
+            .query(&[("key", key)])
+            .send()
+            .await?;
+
+        Self::handle_response(resp).await
     }
 
     pub async fn delete(&self, collection: &str, key: &str) -> Result<bool> {
         Ok(self
             .client
-            .delete(self.url(format!("/{}/{}", collection, key)))
+            .delete(self.url(format!("{collection}/{key}")))
             .send()
             .await?
             .status()
@@ -192,7 +203,7 @@ impl SmolKv {
     pub async fn exists(&self, collection: &str, key: &str) -> Result<bool> {
         Ok(self
             .client
-            .head(self.url(format!("/{}/{}", collection, key)))
+            .head(self.url(format!("{collection}/{key}")))
             .send()
             .await?
             .status()
@@ -225,5 +236,73 @@ impl SmolKv {
             StatusCode::OK => Ok(resp),
             _ => Err(Error::NotFound(collection.to_string())),
         }
+    }
+    pub async fn start_backup(&self, collection: &str) -> Result<Value> {
+        let resp = self
+            .client
+            .post(self.url(format!("{collection}/_backup")))
+            .send()
+            .await?;
+
+        Self::handle_response(resp).await
+    }
+    pub async fn backup_status(&self, collection: &str, id: &str) -> Result<Value> {
+        let resp = self
+            .client
+            .get(self.url(format!("{collection}/_backup/status?id={id}")))
+            .send()
+            .await?;
+
+        Self::handle_response(resp).await
+    }
+    pub async fn download_backup(&self, collection: &str, backup_id: &str) -> Result<bytes::Bytes> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/backups/{collection}-{backup_id}.sst",
+                self.endpoint
+            ))
+            .send()
+            .await?;
+
+        match resp.status() {
+            StatusCode::OK => Ok(resp.bytes().await?),
+            StatusCode::NOT_FOUND => Err(Error::NotFound(backup_id.to_string())),
+            s => Err(Error::Server(format!("unexpected status: {}", s))),
+        }
+    }
+    pub async fn upload_backup(&self, collection: &str, backup_data: Vec<u8>) -> Result<Value> {
+        let part = reqwest::multipart::Part::bytes(backup_data)
+            .file_name(format!("{collection}-backup.sst"));
+
+        let form = reqwest::multipart::Form::new().part("file", part);
+
+        let resp = self
+            .client
+            .post(self.url(format!("{collection}/_backup/upload")))
+            .multipart(form)
+            .send()
+            .await?;
+
+        Self::handle_response(resp).await
+    }
+    pub async fn start_restore(&self, collection: &str, id: &str) -> Result<Value> {
+        let resp = self
+            .client
+            .post(self.url(format!("{collection}/_restore?backup_id={id}")))
+            .send()
+            .await?;
+
+        Self::handle_response(resp).await
+    }
+
+    pub async fn restore_status(&self, collection: &str, id: &str) -> Result<Value> {
+        let resp = self
+            .client
+            .get(self.url(format!("{collection}/_restore/status?id={id}")))
+            .send()
+            .await?;
+
+        Self::handle_response(resp).await
     }
 }
